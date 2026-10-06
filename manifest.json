@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "steam-nvidia-cleanup",
+  "name": "Steam NVIDIA Cleanup",
+  "version": "1.0.0",
+  "author": "Claude Code / Thomas Alt",
+  "description": "Detects NVIDIA userspace drivers (nvidia-utils, lib32-nvidia-utils) that installing Steam pulled onto a machine without an NVIDIA GPU, and notifies you to run the bundled cleanup. No bar icon.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

@@ -1,0 +1,208 @@
+#!/bin/bash
+# omarchy-steam-nvidia-cleanup
+#
+# Removes NVIDIA userspace drivers that installing Steam pulled onto a
+# machine without an NVIDIA GPU.
+#
+# Steam depends on the virtual packages vulkan-driver and
+# lib32-vulkan-driver. When pacman asks which provider to install, the
+# first choice offered is often nvidia-utils / lib32-nvidia-utils -- and
+# accepting it on an AMD or Intel machine leaves ~1.4 GB of NVIDIA
+# libraries behind, plus a boot error from systemd-modules-load
+# ("Failed to find module 'nvidia_uvm'", from nvidia-utils'
+# modules-load.d entry). Installing the right driver afterwards
+# (lib32-vulkan-radeon, lib32-vulkan-intel) doesn't remove them.
+#
+# The check goes in this order, and stops at the first "no":
+#
+#   1. Is Steam installed?
+#   2. Are nvidia-utils / lib32-nvidia-utils installed -- as dependencies,
+#      not explicitly? Explicitly installed packages are left alone.
+#   3. Is this machine NVIDIA-free? Refuses if an NVIDIA GPU is on the PCI
+#      bus, or an NVIDIA kernel driver (nvidia, nvidia-open, *-dkms, or
+#      any nvidia.ko) is installed -- the latter catches an eGPU that is
+#      just unplugged right now.
+#   4. Does `pacman -Rs` succeed in a dry run? That fails if Steam would
+#      be left without a Vulkan driver, i.e. the AMD/Intel one is missing.
+#
+# Usage:
+#   omarchy-steam-nvidia-cleanup --check [--quiet]   # read-only; exit 0 = nothing to do, 1 = cleanup recommended, 3 = blocked (see message)
+#   sudo omarchy-steam-nvidia-cleanup [--yes] [--no-snapshot]
+#                                                     # snapshot, then pacman -Rs of the stray packages
+
+set -uo pipefail
+
+CANDIDATES=(nvidia-utils lib32-nvidia-utils)
+
+MODE="fix"
+QUIET=0
+YES=0
+SNAPSHOT=1
+
+usage() {
+  cat <<USAGE
+Usage:
+  omarchy-steam-nvidia-cleanup --check [--quiet]
+      Read-only. Exit 0 = nothing to do (no Steam, no stray NVIDIA
+      packages, or an NVIDIA GPU/driver is present). Exit 1 = the stray
+      packages can be removed. Exit 3 = they're stray, but pacman would
+      leave Steam without a Vulkan driver -- install the one for your GPU
+      first.
+
+  sudo omarchy-steam-nvidia-cleanup [--yes] [--no-snapshot]
+      Re-runs the check, creates a snapshot with omarchy-snapshot (unless
+      --no-snapshot), then runs 'pacman -Rs' on the stray packages.
+      pacman shows the list and asks before removing, unless --yes.
+USAGE
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --check) MODE="check" ;;
+    --fix) MODE="fix" ;;
+    --quiet) QUIET=1 ;;
+    --yes) YES=1 ;;
+    --no-snapshot) SNAPSHOT=0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+log() { (( QUIET )) || echo "$@"; }
+
+# NVIDIA display controllers (PCI vendor 0x10de, class 0x03xxxx).
+nvidia_gpus() {
+  local dev
+  for dev in /sys/bus/pci/devices/*; do
+    [[ "$(cat "$dev/vendor" 2>/dev/null)" == 0x10de ]] || continue
+    [[ "$(cat "$dev/class" 2>/dev/null)" == 0x03* ]] || continue
+    basename "$dev"
+  done
+}
+
+# Installed NVIDIA kernel driver packages, plus any nvidia.ko on disk
+# (AUR, DKMS or hand-built drivers that pacman doesn't name the usual way).
+nvidia_kernel_drivers() {
+  pacman -Qq 2>/dev/null | grep -xE 'nvidia(-open)?(-lts)?(-dkms)?|nvidia-[0-9]+xx(-dkms)?|nvidia-(beta|open-beta)(-dkms)?'
+  find /lib/modules /usr/lib/modules -name 'nvidia.ko*' -print -quit 2>/dev/null
+}
+
+# The candidates installed as dependencies (pacman -Qd). Explicitly
+# installed ones are someone's deliberate choice.
+stray_packages() {
+  local p
+  for p in "${CANDIDATES[@]}"; do
+    pacman -Qdq "$p" >/dev/null 2>&1 && echo "$p"
+  done
+}
+
+explicit_packages() {
+  local p
+  for p in "${CANDIDATES[@]}"; do
+    pacman -Qeq "$p" >/dev/null 2>&1 && echo "$p"
+  done
+}
+
+# Which Vulkan driver to install for the GPU(s) actually present.
+driver_hint() {
+  local dev vendor hint=""
+  for dev in /sys/bus/pci/devices/*; do
+    [[ "$(cat "$dev/class" 2>/dev/null)" == 0x03* ]] || continue
+    vendor=$(cat "$dev/vendor" 2>/dev/null)
+    case "$vendor" in
+      0x1002) hint="vulkan-radeon lib32-vulkan-radeon" ;;
+      0x8086) [[ -z "$hint" ]] && hint="vulkan-intel lib32-vulkan-intel" ;;
+    esac
+  done
+  echo "${hint:-the Vulkan driver for your GPU (vulkan-radeon/vulkan-intel and its lib32- package)}"
+}
+
+installed_size_mib() {
+  LC_ALL=C pacman -Qi "$@" 2>/dev/null | awk '
+    /^Installed Size/ {
+      v = $4; u = $5
+      if (u == "KiB") v /= 1024; else if (u == "GiB") v *= 1024; else if (u == "B") v /= 1048576
+      s += v
+    }
+    END { printf "%.0f", s }'
+}
+
+# Sets STRAY. Returns the --check exit code.
+run_check() {
+  STRAY=()
+
+  if ! pacman -Qq steam >/dev/null 2>&1; then
+    log "Steam isn't installed. Nothing to do."
+    return 0
+  fi
+
+  mapfile -t STRAY < <(stray_packages)
+  if (( ${#STRAY[@]} == 0 )); then
+    local explicit
+    explicit=$(explicit_packages | paste -sd' ')
+    if [[ -n "$explicit" ]]; then
+      log "Installed explicitly, so left alone: $explicit"
+    else
+      log "No NVIDIA userspace drivers installed. Nothing to do."
+    fi
+    return 0
+  fi
+
+  local gpus drivers
+  gpus=$(nvidia_gpus | paste -sd' ')
+  if [[ -n "$gpus" ]]; then
+    log "NVIDIA GPU present (PCI $gpus) -- ${STRAY[*]} are needed here. Nothing to do."
+    return 0
+  fi
+  drivers=$(nvidia_kernel_drivers | paste -sd' ')
+  if [[ -n "$drivers" ]]; then
+    log "An NVIDIA kernel driver is installed ($drivers) -- probably for an eGPU that isn't connected now. Leaving ${STRAY[*]} alone."
+    return 0
+  fi
+
+  local sim
+  if ! sim=$(pacman -Rsp --print-format '%n' "${STRAY[@]}" 2>&1); then
+    log "Stray NVIDIA packages found (${STRAY[*]}), but removing them would break dependencies:"
+    log "$sim" | sed 's/^/  /'
+    log "Install the driver for your GPU first: sudo pacman -S --needed $(driver_hint)"
+    return 3
+  fi
+
+  log "Steam pulled in NVIDIA drivers, but this machine has no NVIDIA GPU."
+  log "Removable ($(installed_size_mib $sim) MiB): $(echo $sim)"
+  log "Run: sudo $0"
+  return 1
+}
+
+run_fix() {
+  if (( EUID != 0 )); then
+    echo "This needs root. Re-run as: sudo $0" >&2
+    exit 1
+  fi
+
+  run_check
+  local rc=$?
+  (( rc == 1 )) || exit $(( rc == 0 ? 0 : 1 ))
+
+  if (( SNAPSHOT )); then
+    if command -v omarchy-snapshot >/dev/null; then
+      log "Creating a snapshot first..."
+      omarchy-snapshot create || { echo "Snapshot failed; aborting (use --no-snapshot to skip)." >&2; exit 1; }
+    else
+      log "omarchy-snapshot not found -- continuing without a snapshot."
+    fi
+  fi
+
+  local args=(-Rs)
+  (( YES )) && args+=(--noconfirm)
+  pacman "${args[@]}" "${STRAY[@]}" || exit 1
+
+  log
+  log "Done. The 'nvidia_uvm' boot error is gone from the next boot on."
+  log "Verify with: $0 --check"
+}
+
+case "$MODE" in
+  check) run_check; exit $? ;;
+  fix) run_fix ;;
+esac
