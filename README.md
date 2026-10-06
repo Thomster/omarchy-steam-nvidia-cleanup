@@ -72,6 +72,9 @@ Built like [omarchy-dkms-audio-guard](https://github.com/Thomster/omarchy-dkms-a
 and [omarchy-nvidia-dkms-guard](https://github.com/Thomster/omarchy-nvidia-dkms-guard).
 The latter is the opposite case: machines that *do* have an NVIDIA GPU.
 
+After the cleanup, [omarchy-amdgpu-guard](https://github.com/Thomster/omarchy-amdgpu-guard)
+checks that the AMD stack (Vulkan 64/32-bit, VA-API) still works.
+
 ## Changelog
 
 Current version: **1.0.0**. See [CHANGELOG.md](CHANGELOG.md).
